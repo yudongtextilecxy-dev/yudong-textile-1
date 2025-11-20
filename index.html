@@ -1,0 +1,2050 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>宇东纺织报价系统 - Cloudflare R2云端版</title>
+    
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    
+    <!-- Element Plus -->
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+    <script src="https://unpkg.com/element-plus/dist/index.full.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- AWS SDK (兼容Cloudflare R2) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/aws-sdk/2.1462.0/aws-sdk.min.js"></script>
+    
+    <!-- 其他必要库 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    
+    <style>
+        /* 自定义样式 */
+        .gradient-bg {
+            background: linear-gradient(135deg, #52D1B2 0%, #40A891 100%);
+        }
+        
+        .stat-card {
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(8px);
+        }
+        
+        .tab-button {
+            transition: all 0.3s ease;
+        }
+        
+        .tab-button.active {
+            background: linear-gradient(135deg, #52D1B2 0%, #40A891 100%);
+            color: white;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        .product-card {
+            transition: all 0.3s ease;
+        }
+        
+        .product-card:hover {
+            box-shadow: 0 10px 15px rgba(0, 0, 0, 0.1);
+            transform: translateY(-2px);
+        }
+        
+        .image-preview {
+            transition: all 0.3s ease;
+        }
+        
+        .image-preview:hover {
+            transform: scale(1.05);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15);
+        }
+        
+        /* 新增样式 */
+        .header-section {
+            padding-bottom: 2rem;
+        }
+        
+        .main-content {
+            margin-top: 2rem;
+        }
+        
+        .button-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+        }
+        
+        .button-group button {
+            flex: 1 1 auto;
+            min-width: 120px;
+            padding: 0.5rem 1rem;
+            font-size: 0.875rem;
+        }
+        
+        .data-backup-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 1.5rem;
+        }
+        
+        @media (min-width: 768px) {
+            .data-backup-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div id="app"></div>
+
+    <script>
+        // 确保Vue和Element Plus加载完成
+        document.addEventListener('DOMContentLoaded', function() {
+            const { createApp, ref, reactive, computed, onMounted, watch } = Vue;
+            const { ElMessage, ElMessageBox, ElLoading } = ElementPlus;
+            
+            const app = createApp({
+                setup() {
+                    // 响应式数据
+                    const loading = ref(true);
+                    const activeTab = ref('query');
+                    const searchInput = ref('');
+                    const searchHistory = ref([]);
+                    const catalogData = ref({});
+                    const searchResults = ref([]);
+                    const fuzzyMatches = ref([]);
+                    const rangeResults = ref([]);
+                    const manageSearchTerm = ref('');
+                    const manageCurrentPage = ref(1);
+                    const managePageSize = ref(20);
+                    const filteredManageProducts = ref([]);
+                    const hasMoreProducts = ref(false);
+                    const editingProduct = ref(null);
+                    const productForm = reactive({
+                        code: '',
+                        price: '',
+                        priceAlt: '',
+                        width: '',
+                        composition: '',
+                        weight: '',
+                        notes: '',
+                        supplier: '',
+                        imageFile: null
+                    });
+                    const r2Config = reactive({
+                        accountId: '',
+                        accessKey: '',
+                        secretKey: '',
+                        bucket: '',
+                        customDomain: 'https://img.yudong-textile.top'
+                    });
+                    const s3Client = ref(null);
+                    const imageModalVisible = ref(false);
+                    const currentImage = ref('');
+                    const backupFiles = ref([]);
+                    const operationMessage = ref({ text: '', type: '' });
+                    
+                    // 计算属性
+                    const stats = computed(() => {
+                        const totalProducts = Object.keys(catalogData.value).length;
+                        let r2Images = 0;
+                        let localImages = 0;
+                        let missingImages = 0;
+                        
+                        Object.values(catalogData.value).forEach(product => {
+                            if (product.image) {
+                                if (product.image.includes(r2Config.customDomain) || 
+                                    product.image.includes('.r2.cloudflarestorage.com')) {
+                                    r2Images++;
+                                } else if (product.image.startsWith('data:image')) {
+                                    localImages++;
+                                } else {
+                                    r2Images++;
+                                }
+                            } else {
+                                missingImages++;
+                            }
+                        });
+                        
+                        const estimatedSize = estimateDataSize();
+                        const healthScore = calculateHealthScore(totalProducts, r2Images, missingImages);
+                        
+                        return {
+                            totalProducts,
+                            r2Images,
+                            localImages,
+                            missingImages,
+                            storageUsage: formatBytes(estimatedSize, 1),
+                            systemHealth: healthScore
+                        };
+                    });
+                    
+                    const storageStatus = computed(() => {
+                        const dataSize = estimateDataSize();
+                        const warningThreshold = 10 * 1024 * 1024;
+                        const criticalThreshold = 30 * 1024 * 1024;
+                        
+                        if (dataSize > criticalThreshold) {
+                            return {
+                                type: 'error',
+                                message: `⚠️ 存储空间紧张 (${formatBytes(dataSize)}) - 建议立即迁移到Cloudflare R2`
+                            };
+                        } else if (dataSize > warningThreshold) {
+                            return {
+                                type: 'warning',
+                                message: `💾 存储使用量较高 (${formatBytes(dataSize)}) - 建议配置Cloudflare R2`
+                            };
+                        } else {
+                            return null;
+                        }
+                    });
+                    
+                    // 工具函数
+                    const estimateDataSize = () => {
+                        let size = 0;
+                        
+                        const dataStr = JSON.stringify(catalogData.value);
+                        size += new Blob([dataStr]).size;
+                        
+                        Object.values(catalogData.value).forEach(product => {
+                            if (product.image && product.image.startsWith('data:image')) {
+                                size += product.image.length * 3 / 4;
+                            }
+                        });
+                        
+                        return size;
+                    };
+                    
+                    const formatBytes = (bytes, decimals = 2) => {
+                        if (bytes === 0) return '0 Bytes';
+                        
+                        const k = 1024;
+                        const dm = decimals < 0 ? 0 : decimals;
+                        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+                        
+                        const i = Math.floor(Math.log(bytes) / Math.log(k));
+                        
+                        return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+                    };
+                    
+                    const calculateHealthScore = (totalProducts, r2Images, missingImages) => {
+                        if (totalProducts === 0) return '0%';
+                        
+                        let score = 100;
+                        
+                        score -= (missingImages / totalProducts) * 50;
+                        
+                        const r2Ratio = r2Images / (totalProducts - missingImages);
+                        score += r2Ratio * 20;
+                        
+                        score = Math.max(0, Math.min(100, score));
+                        
+                        return Math.round(score) + '%';
+                    };
+                    
+                    const showOperationMessage = (text, type) => {
+                        operationMessage.value = { text, type };
+                        
+                        if (type !== 'loading') {
+                            setTimeout(() => {
+                                operationMessage.value = { text: '', type: '' };
+                            }, 5000);
+                        }
+                    };
+                    
+                    // 标签页切换
+                    const switchTab = (tabName) => {
+                        activeTab.value = tabName;
+                    };
+                    
+                    // 搜索相关功能
+                    const handleSearch = (inputValue) => {
+                        const input = (inputValue || searchInput.value).trim().toUpperCase();
+                        if (!input) {
+                            searchResults.value = [];
+                            fuzzyMatches.value = [];
+                            rangeResults.value = [];
+                            return;
+                        }
+                        
+                        if (!searchHistory.value.includes(input)) {
+                            searchHistory.value.push(input);
+                            if (searchHistory.value.length > 10) searchHistory.value.shift();
+                            saveDataToR2();
+                        }
+                        
+                        const parsed = parseRangeInput(input);
+                        if (parsed.ranges.length > 0 && (parsed.type === 'price' || parsed.type === 'weight')) {
+                            rangeResults.value = performRangeQuery(parsed.ranges, parsed.type);
+                            searchResults.value = [];
+                            fuzzyMatches.value = [];
+                        } else {
+                            const codes = input.split(/[\s,;\n]+/).map(c => c.trim()).filter(c => c.length > 0);
+                            searchResults.value = [];
+                            fuzzyMatches.value = [];
+                            rangeResults.value = [];
+                            
+                            codes.forEach(code => {
+                                if (catalogData.value[code]) {
+                                    const result = JSON.parse(JSON.stringify(catalogData.value[code]));
+                                    result.found = true;
+                                    result.matchType = 'exact';
+                                    searchResults.value.push(result);
+                                } else {
+                                    const matches = Object.keys(catalogData.value).filter(key => {
+                                        const product = catalogData.value[key];
+                                        const codeMatch = key.toUpperCase().includes(code);
+                                        const supplierMatch = product.supplier && product.supplier !== '-' &&
+                                                            product.supplier.toUpperCase().includes(code);
+                                        return codeMatch || supplierMatch;
+                                    });
+                                    
+                                    if (matches.length === 1) {
+                                        const result = JSON.parse(JSON.stringify(catalogData.value[matches[0]]));
+                                        result.found = true;
+                                        result.matchType = 'fuzzy';
+                                        searchResults.value.push(result);
+                                    } else if (matches.length > 1) {
+                                        fuzzyMatches.value.push({ searchTerm: code, matches: matches.slice(0, 50) });
+                                    } else {
+                                        searchResults.value.push({ code: code, found: false, error: '未找到该产品' });
+                                    }
+                                }
+                            });
+                        }
+                    };
+                    
+                    const parseRangeInput = (input) => {
+                        const ranges = [];
+                        const items = input.split(/[,，\s]+/).map(item => item.trim()).filter(item => item);
+                        let type = null;
+                        
+                        items.forEach(item => {
+                            const upper = item.toUpperCase();
+                            let min = null, max = null, label = item;
+                            
+                            if (upper.includes('元')) {
+                                type = 'price';
+                                if (upper.includes('以上')) {
+                                    min = parseFloat(upper.replace(/[^0-9.]/g, ''));
+                                    max = Infinity;
+                                } else if (upper.includes('内')) {
+                                    max = parseFloat(upper.replace(/[^0-9.]/g, ''));
+                                    min = 0;
+                                } else {
+                                    const match = upper.match(/(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)元/);
+                                    if (match) {
+                                        min = parseFloat(match[1]);
+                                        max = parseFloat(match[2]);
+                                    }
+                                }
+                            } else if (upper.includes('克')) {
+                                type = 'weight';
+                                if (upper.includes('以上')) {
+                                    min = parseFloat(upper.replace(/[^0-9.]/g, ''));
+                                    max = Infinity;
+                                } else if (upper.includes('内')) {
+                                    max = parseFloat(upper.replace(/[^0-9.]/g, ''));
+                                    min = 0;
+                                } else {
+                                    const match = upper.match(/(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)克/);
+                                    if (match) {
+                                        min = parseFloat(match[1]);
+                                        max = parseFloat(match[2]);
+                                    }
+                                }
+                            }
+                            
+                            if (min !== null || max !== null) {
+                                ranges.push({ min, max, label, type });
+                            }
+                        });
+                        
+                        return { ranges, type };
+                    };
+                    
+                    const performRangeQuery = (ranges, type) => {
+                        const results = [];
+                        const field = type === 'price' ? 'priceAlt' : 'weight';
+                        
+                        ranges.forEach(range => {
+                            const matches = [];
+                            Object.values(catalogData.value).forEach(product => {
+                                const value = parseFloat(product[field]);
+                                if (!isNaN(value) && value >= (range.min || 0) && value <= (range.max || Infinity)) {
+                                    const match = JSON.parse(JSON.stringify(product));
+                                    match.matchType = 'range';
+                                    match.rangeLabel = range.label;
+                                    matches.push(match);
+                                }
+                            });
+                            
+                            matches.sort((a, b) => {
+                                const seriesA = a.code.match(/^[YC]*([ACDFGJMST])/);
+                                const seriesB = b.code.match(/^[YC]*([ACDFGJMST])/);
+                                const seriesAChar = seriesA ? seriesA[1] : '';
+                                const seriesBChar = seriesB ? seriesB[1] : '';
+                                if (seriesAChar !== seriesBChar) return seriesAChar.localeCompare(seriesBChar);
+                                const numA = parseInt(a.code.replace(/^[YC]*[ACDFGJMST]/, '')) || 0;
+                                const numB = parseInt(b.code.replace(/^[YC]*[ACDFGJMST]/, '')) || 0;
+                                return numA - numB;
+                            });
+                            
+                            const result = JSON.parse(JSON.stringify(range));
+                            result.matches = matches;
+                            results.push(result);
+                        });
+                        
+                        return results;
+                    };
+                    
+                    const loadHistory = (query) => {
+                        searchInput.value = query;
+                        handleSearch(query);
+                        activeTab.value = 'query';
+                    };
+                    
+                    const clearSearchHistory = async () => {
+                        if (!confirm('确定要清除所有搜索历史吗？')) {
+                            return;
+                        }
+                        
+                        searchHistory.value = [];
+                        await saveDataToR2();
+                        showOperationMessage('搜索历史已清除', 'success');
+                    };
+                    
+                    const selectFuzzyMatch = (code) => {
+                        searchInput.value = code;
+                        handleSearch(code);
+                        activeTab.value = 'query';
+                    };
+                    
+                    const selectCode = (code) => {
+                        searchInput.value = code;
+                        handleSearch(code);
+                        activeTab.value = 'query';
+                    };
+                    
+                    // 产品管理相关
+                    const addOrUpdateProduct = async () => {
+                        const code = productForm.code.trim().toUpperCase();
+                        if (!code || !code.match(/^[YC]*[ACDFGJMST]\d+/)) {
+                            showOperationMessage('产品代码格式无效（例如：C6001, YC2001）', 'error');
+                            return;
+                        }
+                        
+                        if (catalogData.value[code] && editingProduct.value !== code) {
+                            if (!confirm('产品代码已存在，是否覆盖？')) {
+                                return;
+                            }
+                        }
+                        
+                        let imageUrl = catalogData.value[code] ? catalogData.value[code].image : null;
+                        
+                        if (productForm.imageFile) {
+                            if (productForm.imageFile.size > 5 * 1024 * 1024) {
+                                showOperationMessage('图片过大（>5MB），请压缩后上传', 'error');
+                                return;
+                            }
+                            
+                            try {
+                                showOperationMessage('正在上传图片...', 'loading');
+                                imageUrl = await uploadToR2(productForm.imageFile, code);
+                                showOperationMessage('图片上传成功', 'success');
+                            } catch (error) {
+                                console.error('Cloudflare R2上传失败:', error);
+                                showOperationMessage('图片上传失败: ' + error.message, 'error');
+                                return;
+                            }
+                        }
+                        
+                        catalogData.value[code] = {
+                            code: code,
+                            price: productForm.price || '-',
+                            priceAlt: productForm.priceAlt || '-',
+                            width: productForm.width || '-',
+                            composition: productForm.composition || '-',
+                            weight: productForm.weight || '-',
+                            notes: productForm.notes || '-',
+                            supplier: productForm.supplier || '-',
+                            image: imageUrl
+                        };
+                        
+                        try {
+                            await saveDataToR2();
+                            
+                            if (editingProduct.value) {
+                                showOperationMessage('产品已更新', 'success');
+                            } else {
+                                showOperationMessage('产品已添加', 'success');
+                            }
+                            
+                            clearProductForm();
+                            renderManageProducts();
+                        } catch (error) {
+                            console.error('保存失败:', error);
+                            showOperationMessage('保存失败，请重试', 'error');
+                        }
+                    };
+                    
+                    const editProduct = (code) => {
+                        const product = catalogData.value[code];
+                        if (!product) return;
+                        
+                        activeTab.value = 'manage';
+                        
+                        editingProduct.value = code;
+                        productForm.code = product.code;
+                        productForm.price = product.price;
+                        productForm.priceAlt = product.priceAlt;
+                        productForm.width = product.width;
+                        productForm.composition = product.composition;
+                        productForm.weight = product.weight;
+                        productForm.notes = product.notes;
+                        productForm.supplier = product.supplier;
+                        productForm.imageFile = null;
+                        
+                        showOperationMessage('编辑模式：修改后点击"更新产品"', 'loading');
+                    };
+                    
+                    const deleteProduct = async () => {
+                        if (!editingProduct.value) return;
+                        
+                        if (!confirm(`确定删除此产品 ${editingProduct.value} 吗？`)) {
+                            return;
+                        }
+                        
+                        delete catalogData.value[editingProduct.value];
+                        await saveDataToR2();
+                        clearProductForm();
+                        renderManageProducts();
+                        showOperationMessage('产品已删除', 'success');
+                    };
+                    
+                    const deleteProductFromList = async (code) => {
+                        if (!confirm(`确定删除产品 ${code} 吗？`)) {
+                            return;
+                        }
+                        
+                        delete catalogData.value[code];
+                        await saveDataToR2();
+                        renderManageProducts();
+                        showOperationMessage('产品已删除', 'success');
+                    };
+                    
+                    const clearProductForm = () => {
+                        productForm.code = '';
+                        productForm.price = '';
+                        productForm.priceAlt = '';
+                        productForm.width = '';
+                        productForm.composition = '';
+                        productForm.weight = '';
+                        productForm.notes = '';
+                        productForm.supplier = '';
+                        productForm.imageFile = null;
+                        editingProduct.value = null;
+                        operationMessage.value = { text: '', type: '' };
+                    };
+                    
+                    const handleImageUpload = (event) => {
+                        const file = event.target.files[0];
+                        if (file) {
+                            productForm.imageFile = file;
+                        }
+                    };
+                    
+                    // ESC键关闭图片功能
+                    const handleKeyDown = (event) => {
+                        if (event.key === 'Escape' && imageModalVisible.value) {
+                            imageModalVisible.value = false;
+                        }
+                    };
+                    
+                    const showImage = (imageSrc, productCode) => {
+                        currentImage.value = imageSrc;
+                        imageModalVisible.value = true;
+                        
+                        // 添加键盘事件监听
+                        document.addEventListener('keydown', handleKeyDown);
+                    };
+                    
+                    const closeImageModal = () => {
+                        imageModalVisible.value = false;
+                        // 移除键盘事件监听
+                        document.removeEventListener('keydown', handleKeyDown);
+                    };
+                    
+                    // 产品管理列表相关
+                    const filterManageProducts = () => {
+                        manageCurrentPage.value = 1;
+                        renderManageProducts();
+                    };
+                    
+                    const renderManageProducts = () => {
+                        filteredManageProducts.value = Object.keys(catalogData.value)
+                            .filter(code => {
+                                if (!manageSearchTerm.value) return true;
+                                const product = catalogData.value[code];
+                                return code.toUpperCase().includes(manageSearchTerm.value) || 
+                                      (product.supplier && product.supplier.toUpperCase().includes(manageSearchTerm.value));
+                            })
+                            .sort();
+                        
+                        const startIndex = (manageCurrentPage.value - 1) * managePageSize.value;
+                        const endIndex = startIndex + managePageSize.value;
+                        const productsToShow = filteredManageProducts.value.slice(0, endIndex);
+                        hasMoreProducts.value = endIndex < filteredManageProducts.value.length;
+                        
+                        return productsToShow;
+                    };
+                    
+                    const loadMoreProducts = () => {
+                        manageCurrentPage.value++;
+                    };
+                    
+                    // R2配置相关
+                    const saveR2Config = () => {
+                        if (!r2Config.accountId || !r2Config.accessKey || 
+                            !r2Config.secretKey || !r2Config.bucket || !r2Config.customDomain) {
+                            showOperationMessage('请填写完整的Cloudflare R2配置', 'error');
+                            return;
+                        }
+                        
+                        // 确保customDomain以斜杠结尾
+                        const formattedCustomDomain = r2Config.customDomain.endsWith('/') ? 
+                            r2Config.customDomain : r2Config.customDomain + '/';
+                        r2Config.customDomain = formattedCustomDomain;
+                        
+                        localStorage.setItem('r2-config', JSON.stringify(r2Config));
+                        showOperationMessage('Cloudflare R2配置已保存', 'success');
+                        
+                        initS3Client();
+                    };
+                    
+                    const loadR2Config = () => {
+                        const savedConfig = JSON.parse(localStorage.getItem('r2-config') || '{}');
+                        Object.assign(r2Config, savedConfig);
+                        
+                        if (r2Config.accessKey && r2Config.secretKey) {
+                            initS3Client();
+                        }
+                    };
+                    
+                    const initS3Client = () => {
+                        if (!r2Config.accessKey || !r2Config.secretKey) return;
+                        
+                        try {
+                            AWS.config.update({
+                                accessKeyId: r2Config.accessKey,
+                                secretAccessKey: r2Config.secretKey,
+                                region: 'auto'
+                            });
+                            
+                            s3Client.value = new AWS.S3({
+                                endpoint: `https://${r2Config.accountId}.r2.cloudflarestorage.com`,
+                                signatureVersion: 'v4'
+                            });
+                            
+                            console.log('Cloudflare R2 S3客户端已初始化');
+                            loadDataFromR2();
+                        } catch (error) {
+                            console.error('S3客户端初始化失败:', error);
+                            showOperationMessage('S3客户端初始化失败: ' + error.message, 'error');
+                        }
+                    };
+                    
+                    const testR2Connection = async () => {
+                        if (!r2Config.accessKey || !r2Config.bucket) {
+                            showOperationMessage('请先保存Cloudflare R2配置', 'error');
+                            return;
+                        }
+                        
+                        if (!s3Client.value) initS3Client();
+                        
+                        showOperationMessage('正在测试R2连接...', 'loading');
+                        
+                        try {
+                            const testContent = new Blob(['R2 Connection Test'], { type: 'text/plain' });
+                            const testKey = `test-connection-${Date.now()}.txt`;
+                            
+                            await s3Client.value.putObject({
+                                Bucket: r2Config.bucket,
+                                Key: testKey,
+                                Body: testContent,
+                                ContentType: 'text/plain'
+                            }).promise();
+                            
+                            // 测试成功，删除测试文件
+                            await s3Client.value.deleteObject({
+                                Bucket: r2Config.bucket,
+                                Key: testKey
+                            }).promise();
+                            
+                            // 测试自定义域名访问
+                            await testCustomDomainAccess();
+                            
+                            showOperationMessage('R2连接测试成功！', 'success');
+                        } catch (error) {
+                            console.error('R2连接测试失败:', error);
+                            let errorMsg = 'R2连接测试失败: ';
+                            
+                            if (error.statusCode === 403) {
+                                errorMsg = '权限错误：请检查Access Key/Secret Key是否正确';
+                            } else if (error.statusCode === 404) {
+                                errorMsg = '存储桶不存在：请检查Bucket名称是否正确';
+                            } else if (error.statusCode === 400) {
+                                errorMsg = '请求参数错误：请检查配置格式';
+                            } else if (error.code === 'NetworkingError' || error.message?.includes('CORS')) {
+                                errorMsg = '网络错误：请检查网络连接或CORS配置';
+                            } else {
+                                errorMsg += error.message || '未知错误，请检查网络连接和配置';
+                            }
+                            
+                            showOperationMessage(errorMsg, 'error');
+                        }
+                    };
+                    
+                    const testCustomDomainAccess = () => {
+                        return new Promise((resolve) => {
+                            if (!r2Config.customDomain) {
+                                resolve();
+                                return;
+                            }
+                            
+                            const testImageUrl = `${r2Config.customDomain}yudong-fabric/test-image-${Date.now()}.jpg`;
+                            const testImage = new Image();
+                            
+                            testImage.onload = function() {
+                                console.log('自定义域名访问正常');
+                                resolve();
+                            };
+                            
+                            testImage.onerror = function() {
+                                console.warn('自定义域名访问可能有问题');
+                                resolve();
+                            };
+                            
+                            testImage.src = testImageUrl;
+                        });
+                    };
+                    
+                    // 数据存储相关
+                    const generateImageUrl = (productCode) => {
+                        if (!r2Config.customDomain) {
+                            console.warn('R2自定义域名未配置');
+                            return null;
+                        }
+                        
+                        const baseUrl = r2Config.customDomain.endsWith('/') ? 
+                            r2Config.customDomain : r2Config.customDomain + '/';
+                        
+                        return `${baseUrl}yudong-fabric/${productCode}.jpg`;
+                    };
+                    
+                    const uploadToR2 = (file, productCode) => {
+                        return new Promise((resolve, reject) => {
+                            if (!s3Client.value) {
+                                reject(new Error('请先配置Cloudflare R2'));
+                                return;
+                            }
+                            
+                            const key = `yudong-fabric/${productCode}.jpg`;
+                            
+                            s3Client.value.putObject({
+                                Bucket: r2Config.bucket,
+                                Key: key,
+                                Body: file,
+                                ContentType: 'image/jpeg'
+                            }, function(err, data) {
+                                if (err) {
+                                    console.error('R2上传失败:', err);
+                                    reject(err);
+                                } else {
+                                    console.log('R2上传成功:', data);
+                                    const imageUrl = generateImageUrl(productCode);
+                                    console.log('生成的图片URL:', imageUrl);
+                                    
+                                    verifyImageAccess(imageUrl, productCode)
+                                        .then(() => resolve(imageUrl))
+                                        .catch(verifyErr => {
+                                            console.warn('图片验证失败，但继续使用URL:', verifyErr);
+                                            resolve(imageUrl);
+                                        });
+                                }
+                            });
+                        });
+                    };
+                    
+                    const verifyImageAccess = (imageUrl, productCode) => {
+                        return new Promise((resolve, reject) => {
+                            const testImage = new Image();
+                            testImage.onload = function() {
+                                console.log(`✅ 图片 ${productCode} 可正常访问`);
+                                resolve();
+                            };
+                            testImage.onerror = function() {
+                                console.error(`❌ 图片 ${productCode} 无法访问，请检查R2公共访问设置`);
+                                reject(new Error(`图片 ${productCode} 无法公开访问`));
+                            };
+                            testImage.src = imageUrl + '?t=' + Date.now();
+                        });
+                    };
+                    
+                    const saveDataToR2 = async () => {
+                        if (!s3Client.value) {
+                            console.warn('R2未配置，无法保存数据到云端');
+                            return;
+                        }
+                        
+                        const dataToSave = {
+                            catalogData: catalogData.value,
+                            searchHistory: searchHistory.value,
+                            saveTime: new Date().toISOString(),
+                            version: '5.0-vue'
+                        };
+                        
+                        const dataBlob = new Blob([JSON.stringify(dataToSave, null, 2)], { type: 'application/json' });
+                        const key = 'yudong-cloud/database.json';
+                        
+                        try {
+                            await s3Client.value.upload({
+                                Bucket: r2Config.bucket,
+                                Key: key,
+                                Body: dataBlob,
+                                ContentType: 'application/json'
+                            }).promise();
+                            
+                            console.log('数据已保存到R2');
+                        } catch (error) {
+                            console.error('保存数据到R2失败:', error);
+                            showOperationMessage('保存数据到R2失败: ' + error.message, 'error');
+                        }
+                    };
+                    
+                    const loadDataFromR2 = async () => {
+                        if (!s3Client.value) {
+                            console.warn('R2未配置，无法从云端加载数据');
+                            return;
+                        }
+                        
+                        try {
+                            const data = await s3Client.value.getObject({
+                                Bucket: r2Config.bucket,
+                                Key: 'yudong-cloud/database.json'
+                            }).promise();
+                            
+                            const dataToLoad = JSON.parse(data.Body.toString());
+                            catalogData.value = dataToLoad.catalogData || {};
+                            searchHistory.value = dataToLoad.searchHistory || [];
+                            
+                            console.log('数据已从R2加载');
+                            showOperationMessage('数据加载成功', 'success');
+                        } catch (error) {
+                            console.warn('从R2加载数据失败，使用空数据:', error);
+                            catalogData.value = {};
+                            searchHistory.value = [];
+                        }
+                    };
+                    
+                    // 数据备份相关
+                    const exportAndUploadBackup = async () => {
+                        if (Object.keys(catalogData.value).length === 0) {
+                            showOperationMessage('无数据可导出', 'error');
+                            return;
+                        }
+                        
+                        showOperationMessage('正在生成备份文件...', 'loading');
+                        
+                        try {
+                            const zip = new JSZip();
+                            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+                            
+                            const fullData = {
+                                catalogData: catalogData.value,
+                                searchHistory: searchHistory.value,
+                                exportTime: new Date().toISOString(),
+                                version: '5.0-vue'
+                            };
+                            
+                            zip.file('database.json', JSON.stringify(fullData, null, 2));
+                            
+                            try {
+                                const rows = [['产品代码', '码价', '米价', '门幅', '成分', '克重', '备注', '供应商']];
+                                Object.values(catalogData.value).forEach(p => {
+                                    rows.push([
+                                        p.code || '-',
+                                        p.price || '-',
+                                        p.priceAlt || '-',
+                                        p.width || '-',
+                                        p.composition || '-',
+                                        p.weight || '-',
+                                        p.notes || '-',
+                                        p.supplier || '-'
+                                    ]);
+                                });
+                                
+                                const wb = XLSX.utils.book_new();
+                                const ws = XLSX.utils.aoa_to_sheet(rows);
+                                XLSX.utils.book_append_sheet(wb, ws, '产品数据');
+                                const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+                                zip.file('产品数据表.xlsx', xlsxBuffer);
+                            } catch (xlsxError) {
+                                console.error('XLSX generation error:', xlsxError);
+                            }
+                            
+                            const content = await zip.generateAsync({
+                                type: 'blob',
+                                compression: 'DEFLATE',
+                                compressionOptions: { level: 6 }
+                            });
+                            
+                            // 下载到本地
+                            const link = document.createElement('a');
+                            link.href = URL.createObjectURL(content);
+                            link.download = '宇东纺织全库备份_' + timestamp + '.zip';
+                            link.click();
+                            URL.revokeObjectURL(link.href);
+                            
+                            // 上传到Cloudflare R2
+                            try {
+                                await uploadBackupToR2(content, link.download);
+                                showOperationMessage('✅ 完整备份导出成功！已同步到Cloudflare R2。', 'success');
+                            } catch (error) {
+                                console.error('备份上传失败:', error);
+                                showOperationMessage('✅ 备份导出成功，但上传到R2失败: ' + error.message, 'warning');
+                            }
+                        } catch (error) {
+                            console.error('ZIP generation error:', error);
+                            showOperationMessage('导出失败：' + error.message, 'error');
+                        }
+                    };
+                    
+                    const uploadBackupToR2 = (backupBlob, fileName) => {
+                        return new Promise((resolve, reject) => {
+                            if (!s3Client.value) {
+                                reject(new Error('请先配置Cloudflare R2'));
+                                return;
+                            }
+                            
+                            const key = `yudong-cloud/${fileName}`;
+                            
+                            s3Client.value.upload({
+                                Bucket: r2Config.bucket,
+                                Key: key,
+                                Body: backupBlob,
+                                ContentType: 'application/zip'
+                            }, function(err, data) {
+                                if (err) {
+                                    console.error('备份上传失败:', err);
+                                    reject(err);
+                                } else {
+                                    resolve(data);
+                                }
+                            });
+                        });
+                    };
+                    
+                    const loadR2BackupFiles = async () => {
+                        if (!s3Client.value) {
+                            showOperationMessage('请先配置Cloudflare R2', 'error');
+                            return;
+                        }
+                        
+                        showOperationMessage('正在加载R2备份文件...', 'loading');
+                        
+                        try {
+                            const data = await s3Client.value.listObjectsV2({
+                                Bucket: r2Config.bucket,
+                                Prefix: 'yudong-cloud/'
+                            }).promise();
+                            
+                            backupFiles.value = data.Contents.filter(item => 
+                                item.Key.endsWith('.zip') && item.Key.startsWith('yudong-cloud/')
+                            ).sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+                            
+                            showOperationMessage(`找到 ${backupFiles.value.length} 个备份文件`, 'success');
+                        } catch (error) {
+                            console.error('加载备份文件列表失败:', error);
+                            showOperationMessage('加载备份文件列表失败: ' + error.message, 'error');
+                        }
+                    };
+                    
+                    const importFromR2Backup = async (fileKey) => {
+                        if (!confirm('确定要从该备份文件导入数据吗？这将覆盖当前所有数据。')) {
+                            return;
+                        }
+                        
+                        showOperationMessage('正在从R2备份导入数据...', 'loading');
+                        
+                        try {
+                            const data = await s3Client.value.getObject({
+                                Bucket: r2Config.bucket,
+                                Key: fileKey
+                            }).promise();
+                            
+                            const blob = new Blob([data.Body], { type: 'application/zip' });
+                            await importDatabase([new File([blob], fileKey.split('/').pop())]);
+                        } catch (error) {
+                            console.error('下载备份文件失败:', error);
+                            showOperationMessage('下载备份文件失败: ' + error.message, 'error');
+                        }
+                    };
+                    
+                    const importDatabase = async (files) => {
+                        if (files.length === 0) return;
+                        const file = files[0];
+                        
+                        showOperationMessage('正在导入数据库...', 'loading');
+                        
+                        try {
+                            if (file.name.endsWith('.json')) {
+                                const text = await readFileAsText(file);
+                                const data = JSON.parse(text);
+                                
+                                if (data.catalogData) {
+                                    catalogData.value = data.catalogData;
+                                    searchHistory.value = data.searchHistory || [];
+                                } else {
+                                    catalogData.value = data;
+                                }
+                                
+                                await saveDataToR2();
+                                renderManageProducts();
+                                showOperationMessage('✅ 数据库导入成功！', 'success');
+                            } else if (file.name.endsWith('.zip')) {
+                                const arrayBuffer = await readFileAsArrayBuffer(file);
+                                const zip = await JSZip.loadAsync(arrayBuffer);
+                                
+                                const jsonFile = zip.file('database.json') || zip.file('数据库备份.json');
+                                
+                                if (jsonFile) {
+                                    const jsonStr = await jsonFile.async('string');
+                                    const data = JSON.parse(jsonStr);
+                                    
+                                    if (data.catalogData) {
+                                        catalogData.value = data.catalogData;
+                                        searchHistory.value = data.searchHistory || [];
+                                    } else {
+                                        catalogData.value = data;
+                                    }
+                                    
+                                    await saveDataToR2();
+                                    renderManageProducts();
+                                    showOperationMessage('✅ 数据库导入成功！共 ' + Object.keys(catalogData.value).length + ' 条数据', 'success');
+                                } else {
+                                    showOperationMessage('导入失败：ZIP中未找到database.json或数据库备份.json', 'error');
+                                }
+                            } else {
+                                showOperationMessage('不支持的文件格式，请上传.json或.zip文件', 'error');
+                            }
+                        } catch (error) {
+                            console.error('导入失败:', error);
+                            showOperationMessage('导入失败：' + error.message, 'error');
+                        }
+                    };
+                    
+                    const readFileAsText = (file) => {
+                        return new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = e => resolve(e.target.result);
+                            reader.onerror = () => reject(new Error('文件读取失败'));
+                            reader.readAsText(file);
+                        });
+                    };
+                    
+                    const readFileAsArrayBuffer = (file) => {
+                        return new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = e => resolve(e.target.result);
+                            reader.onerror = () => reject(new Error('文件读取失败'));
+                            reader.readAsArrayBuffer(file);
+                        });
+                    };
+                    
+                    const clearData = async () => {
+                        if (!confirm('⚠️ 确定要清空所有数据吗？\n\n此操作将删除所有产品数据，且无法恢复！')) {
+                            return;
+                        }
+                        
+                        catalogData.value = {};
+                        searchResults.value = [];
+                        fuzzyMatches.value = [];
+                        rangeResults.value = [];
+                        
+                        await saveDataToR2();
+                        renderManageProducts();
+                        showOperationMessage('所有数据已清空', 'success');
+                    };
+                    
+                    // PDF导出
+                    const exportQuotePDF = () => {
+                        const allResults = [];
+                        if (rangeResults.value.length > 0) {
+                            rangeResults.value.forEach(range => { 
+                                range.matches.forEach(product => { allResults.push(product); }); 
+                            });
+                        } else {
+                            searchResults.value.filter(r => r.found).forEach(r => allResults.push(r));
+                        }
+                        
+                        if (allResults.length === 0) {
+                            showOperationMessage('无结果可导出', 'error');
+                            return;
+                        }
+                        
+                        showOperationMessage('正在生成报价PDF...', 'loading');
+                        
+                        const printContainer = document.createElement('div');
+                        printContainer.id = 'pdf-content';
+                        printContainer.style.cssText = 'position: absolute; left: -9999px; width: 250mm; font-family: "Microsoft YaHei", "微软雅黑", sans-serif; background: white; padding: 15mm; line-height: 1.1;';
+                        document.body.appendChild(printContainer);
+                        
+                        let html = '<h1 style="text-align: center; color: #40A891; font-size: 16pt; margin-bottom: 8mm; border-bottom: 2px solid #40A891; padding-bottom: 4mm;">📊 宇东纺织报价单</h1>';
+                        html += '<div style="text-align: center; color: #666; margin-bottom: 6mm; font-size: 8pt;">生成时间：' + new Date().toLocaleString('zh-CN') + ' | 产品数量：' + allResults.length + ' 项</div>';
+                        html += '<table style="width: 100%; border-collapse: collapse; margin-bottom: 4mm; page-break-inside: auto; font-size: 7pt;">';
+                        html += '<thead><tr style="page-break-inside: avoid; page-break-after: auto;">';
+                        html += '<th style="width: 6%; background-color: #40A891; color: white; padding: 5pt 3pt; text-align: center; font-size: 8pt; border: 1px solid #333; font-weight: bold;">序号</th>';
+                        html += '<th style="width: 14%; background-color: #40A891; color: white; padding: 5pt 3pt; text-align: center; font-size: 8pt; border: 1px solid #333; font-weight: bold;">产品代码</th>';
+                        html += '<th style="width: 9%; background-color: #40A891; color: white; padding: 5pt 3pt; text-align: center; font-size: 8pt; border: 1px solid #333; font-weight: bold;">码价</th>';
+                        html += '<th style="width: 9%; background-color: #40A891; color: white; padding: 5pt 3pt; text-align: center; font-size: 8pt; border: 1px solid #333; font-weight: bold;">米价</th>';
+                        html += '<th style="width: 9%; background-color: #40A891; color: white; padding: 5pt 3pt; text-align: center; font-size: 8pt; border: 1px solid #333; font-weight: bold;">门幅</th>';
+                        html += '<th style="width: 14%; background-color: #40A891; color: white; padding: 5pt 3pt; text-align: center; font-size: 8pt; border: 1px solid #333; font-weight: bold;">成分</th>';
+                        html += '<th style="width: 9%; background-color: #40A891; color: white; padding: 5pt 3pt; text-align: center; font-size: 8pt; border: 1px solid #333; font-weight: bold;">克重</th>';
+                        html += '<th style="width: 20%; background-color: #40A891; color: white; padding: 5pt 3pt; text-align: center; font-size: 8pt; border: 1px solid #333; font-weight: bold;">备注</th>';
+                        html += '</tr></thead><tbody>';
+                        
+                        allResults.forEach((product, index) => {
+                            html += '<tr style="page-break-inside: avoid; page-break-after: auto; height: auto; min-height: 12pt;">';
+                            html += '<td style="padding: 3pt 2pt; text-align: center; border: 1px solid #ddd; font-size: 7pt; vertical-align: middle;">' + (index + 1) + '</td>';
+                            html += '<td style="padding: 3pt 2pt; text-align: center; border: 1px solid #ddd; font-size: 7pt; vertical-align: middle;"><strong>' + product.code + '</strong></td>';
+                            html += '<td style="padding: 3pt 2pt; text-align: center; border: 1px solid #ddd; font-size: 7pt; vertical-align: middle;">' + product.price + '</td>';
+                            html += '<td style="padding: 3pt 2pt; text-align: center; border: 1px solid #ddd; font-size: 7pt; vertical-align: middle;">' + product.priceAlt + '</td>';
+                            html += '<td style="padding: 3pt 2pt; text-align: center; border: 1px solid #ddd; font-size: 7pt; vertical-align: middle;">' + product.width + '</td>';
+                            html += '<td style="padding: 3pt 2pt; text-align: center; border: 1px solid #ddd; font-size: 7pt; vertical-align: middle; word-wrap: break-word;">' + product.composition + '</td>';
+                            html += '<td style="padding: 3pt 2pt; text-align: center; border: 1px solid #ddd; font-size: 7pt; vertical-align: middle;">' + product.weight + '</td>';
+                            html += '<td style="padding: 3pt 2pt; text-align: left; border: 1px solid #ddd; font-size: 6pt; vertical-align: top; color: #d32f2f; word-wrap: break-word; overflow-wrap: break-word; white-space: pre-wrap; line-height: 1.2; hyphens: auto; display: block;">' + (product.notes && product.notes !== '-' ? product.notes : '') + '</td>';
+                            html += '</tr>';
+                        });
+                        
+                        html += '</tbody></table>';
+                        html += '<div style="text-align: center; color: #999; font-size: 6pt; margin-top: 8mm; border-top: 1px solid #ddd; padding-top: 4mm;">本报价单由宇东纺织报价系统生成 | 系统版本：v5.0-Vue</div>';
+                        printContainer.innerHTML = html;
+                        
+                        html2canvas(printContainer, {
+                            scale: 2,
+                            useCORS: true,
+                            allowTaint: true,
+                            backgroundColor: '#ffffff',
+                            width: printContainer.scrollWidth,
+                            height: printContainer.scrollHeight,
+                            logging: false
+                        }).then(canvas => {
+                            const { jsPDF } = window.jspdf;
+                            const pdf = new jsPDF('l', 'mm', 'a4');
+                            const pdfWidth = pdf.internal.pageSize.getWidth();
+                            const pdfHeight = pdf.internal.pageSize.getHeight();
+                            const imgWidth = pdfWidth - 30;
+                            const pageHeight = pdfHeight - 30;
+                            const imgHeight = (canvas.height * imgWidth) / canvas.width;
+                            let heightLeft = imgHeight;
+                            let position = 15;
+                            
+                            pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 15, position, imgWidth, imgHeight);
+                            heightLeft -= pageHeight;
+                            
+                            while (heightLeft >= 0) {
+                                position = heightLeft - imgHeight + 15;
+                                pdf.addPage();
+                                pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 15, position, imgWidth, imgHeight);
+                                heightLeft -= pageHeight;
+                            }
+                            
+                            pdf.save('报价单_' + new Date().toISOString().slice(0, 10) + '.pdf');
+                            showOperationMessage('✅ PDF生成成功！', 'success');
+                            document.body.removeChild(printContainer);
+                        }).catch(error => {
+                            console.error('PDF generation error:', error);
+                            showOperationMessage('PDF生成失败，请重试', 'error');
+                            document.body.removeChild(printContainer);
+                        });
+                    };
+                    
+                    // 初始化
+                    onMounted(() => {
+                        // 模拟初始化过程
+                        setTimeout(() => {
+                            loadR2Config();
+                            loading.value = false;
+                        }, 1000);
+                    });
+                    
+                    // 监听搜索输入变化
+                    let searchTimeout;
+                    watch(searchInput, (newValue) => {
+                        clearTimeout(searchTimeout);
+                        if (newValue && Object.keys(catalogData.value).length > 0) {
+                            searchTimeout = setTimeout(() => {
+                                handleSearch(newValue);
+                            }, 300);
+                        } else {
+                            searchResults.value = [];
+                            fuzzyMatches.value = [];
+                            rangeResults.value = [];
+                        }
+                    });
+                    
+                    return {
+                        loading,
+                        activeTab,
+                        searchInput,
+                        searchHistory,
+                        catalogData,
+                        searchResults,
+                        fuzzyMatches,
+                        rangeResults,
+                        manageSearchTerm,
+                        manageCurrentPage,
+                        managePageSize,
+                        filteredManageProducts,
+                        hasMoreProducts,
+                        editingProduct,
+                        productForm,
+                        r2Config,
+                        s3Client,
+                        imageModalVisible,
+                        currentImage,
+                        backupFiles,
+                        operationMessage,
+                        stats,
+                        storageStatus,
+                        switchTab,
+                        handleSearch,
+                        loadHistory,
+                        clearSearchHistory,
+                        selectFuzzyMatch,
+                        selectCode,
+                        addOrUpdateProduct,
+                        editProduct,
+                        deleteProduct,
+                        deleteProductFromList,
+                        clearProductForm,
+                        handleImageUpload,
+                        showImage,
+                        closeImageModal,
+                        filterManageProducts,
+                        renderManageProducts,
+                        loadMoreProducts,
+                        saveR2Config,
+                        testR2Connection,
+                        exportAndUploadBackup,
+                        loadR2BackupFiles,
+                        importFromR2Backup,
+                        importDatabase,
+                        clearData,
+                        exportQuotePDF
+                    };
+                },
+                
+                template: `
+                <div class="min-h-screen bg-gray-50">
+                    <!-- 加载状态 -->
+                    <div v-if="loading" class="fixed inset-0 bg-white bg-opacity-80 flex items-center justify-center z-50">
+                        <div class="text-center">
+                            <div class="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-green-500"></div>
+                            <p class="mt-4 text-gray-600">系统初始化中...</p>
+                        </div>
+                    </div>
+                    
+                    <!-- 主要内容 -->
+                    <div v-if="!loading" class="min-h-screen bg-gray-50">
+                        <!-- 顶部 Header -->
+                        <div class="gradient-bg text-white shadow-lg header-section">
+                            <div class="container mx-auto px-4 py-6">
+                                <div class="text-center mb-4">
+                                    <h1 class="text-2xl md:text-3xl font-bold mb-2">📊 宇东纺织报价系统</h1>
+                                    <p class="text-sm md:text-base opacity-90">智能查询 · 数据管理 · 专业报价</p>
+                                </div>
+                                
+                                <!-- 统计卡片 -->
+                                <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2 mb-4">
+                                    <div class="stat-card rounded-lg p-3 text-center">
+                                        <div class="text-xl font-bold">{{ stats.totalProducts }}</div>
+                                        <div class="text-xs opacity-90">产品总数</div>
+                                    </div>
+                                    <div class="stat-card rounded-lg p-3 text-center">
+                                        <div class="text-xl font-bold">{{ stats.r2Images }}</div>
+                                        <div class="text-xs opacity-90">R2图片</div>
+                                    </div>
+                                    <div class="stat-card rounded-lg p-3 text-center">
+                                        <div class="text-xl font-bold">{{ stats.localImages }}</div>
+                                        <div class="text-xs opacity-90">本地图片</div>
+                                    </div>
+                                    <div class="stat-card rounded-lg p-3 text-center">
+                                        <div class="text-xl font-bold">{{ stats.missingImages }}</div>
+                                        <div class="text-xs opacity-90">缺失图片</div>
+                                    </div>
+                                    <div class="stat-card rounded-lg p-3 text-center">
+                                        <div class="text-xl font-bold">{{ stats.storageUsage }}</div>
+                                        <div class="text-xs opacity-90">存储用量</div>
+                                    </div>
+                                    <div class="stat-card rounded-lg p-3 text-center">
+                                        <div class="text-xl font-bold">{{ stats.systemHealth }}</div>
+                                        <div class="text-xs opacity-90">系统健康</div>
+                                    </div>
+                                </div>
+                                
+                                <!-- 存储状态 -->
+                                <div class="flex flex-col md:flex-row justify-between items-center bg-white bg-opacity-15 rounded-lg p-3 text-sm">
+                                    <div class="flex items-center space-x-2 mb-2 md:mb-0">
+                                        <span>💾 存储分布:</span>
+                                        <span class="px-2 py-1 rounded-full bg-yellow-500 bg-opacity-20 text-yellow-300 text-xs">本地: {{ stats.localImages }}</span>
+                                        <span class="px-2 py-1 rounded-full bg-green-500 bg-opacity-20 text-green-300 text-xs">R2: {{ stats.r2Images }}</span>
+                                    </div>
+                                    <div>
+                                        <span>{{ s3Client ? '✅ 云端同步' : '⚠️ 仅本地' }}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- 标签页导航 -->
+                        <div class="container mx-auto px-4 main-content relative z-10">
+                            <div class="bg-white rounded-xl shadow-lg overflow-hidden">
+                                <!-- 标签页按钮 -->
+                                <div class="flex border-b">
+                                    <button 
+                                        @click="switchTab('query')"
+                                        :class="{'tab-button active text-white': activeTab === 'query', 'tab-button text-gray-600': activeTab !== 'query'}"
+                                        class="flex-1 py-4 text-center font-semibold transition-all"
+                                    >
+                                        🔍 查询报价
+                                    </button>
+                                    <button 
+                                        @click="switchTab('manage')"
+                                        :class="{'tab-button active text-white': activeTab === 'manage', 'tab-button text-gray-600': activeTab !== 'manage'}"
+                                        class="flex-1 py-4 text-center font-semibold transition-all"
+                                    >
+                                        🛠️ 产品管理
+                                    </button>
+                                    <button 
+                                        @click="switchTab('data')"
+                                        :class="{'tab-button active text-white': activeTab === 'data', 'tab-button text-gray-600': activeTab !== 'data'}"
+                                        class="flex-1 py-4 text-center font-semibold transition-all"
+                                    >
+                                        📦 数据备份
+                                    </button>
+                                </div>
+                                
+                                <!-- 标签页内容 -->
+                                <div class="p-6">
+                                    <!-- 查询报价 -->
+                                    <div v-if="activeTab === 'query'" class="space-y-6">
+                                        <h2 class="text-xl font-bold text-gray-800 border-b pb-2">产品智能查询</h2>
+                                        
+                                        <div class="relative">
+                                            <textarea 
+                                                v-model="searchInput" 
+                                                class="w-full p-4 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500" 
+                                                rows="4" 
+                                                placeholder="输入产品代码、供应商或价格/克重区间...
+
+示例：
+• 产品代码：C6001, Y6
+• 供应商：永联
+• 价格区间：20元以上, 10-15元
+• 克重区间：100克内, 150-200克"
+                                            ></textarea>
+                                        </div>
+                                        
+                                        <div class="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                                            <p class="text-blue-800">
+                                                💡 实时智能搜索已开启：输入即自动匹配产品代码、供应商、价格/克重区间。支持批量查询、模糊搜索与历史记录快速调用。
+                                            </p>
+                                        </div>
+                                        
+                                        <!-- 搜索历史 -->
+                                        <div>
+                                            <h3 class="text-lg font-semibold text-gray-700 mb-2">⌚ 搜索历史</h3>
+                                            <div class="flex flex-wrap gap-2">
+                                                <span 
+                                                    v-for="(item, index) in searchHistory.slice(-5).reverse()" 
+                                                    :key="index"
+                                                    class="px-3 py-1 bg-gray-100 rounded-full text-sm cursor-pointer hover:bg-green-500 hover:text-white transition-colors"
+                                                    @click="loadHistory(item)"
+                                                >
+                                                    {{ item }}
+                                                </span>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="flex flex-wrap gap-3">
+                                            <button 
+                                                class="px-4 py-2 bg-green-500 text-white rounded-lg font-semibold hover:bg-green-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                                :disabled="searchResults.length === 0 && rangeResults.length === 0"
+                                                @click="exportQuotePDF"
+                                            >
+                                                📄 导出报价PDF
+                                            </button>
+                                            <button 
+                                                class="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg font-semibold hover:bg-gray-300 transition-colors"
+                                                @click="clearSearchHistory"
+                                            >
+                                                🗑️ 清除历史
+                                            </button>
+                                        </div>
+                                        
+                                        <!-- 搜索结果 -->
+                                        <div class="mt-6 space-y-4">
+                                            <!-- 搜索结果统计 -->
+                                            <div v-if="searchResults.length > 0" class="bg-green-50 border border-green-200 rounded-lg p-4">
+                                                <p class="text-green-800">
+                                                    📊 共查询 <strong>{{ searchResults.length }}</strong> 个产品，找到 
+                                                    <strong>{{ searchResults.filter(r => r.found).length }}</strong> 个匹配结果
+                                                </p>
+                                            </div>
+                                            
+                                            <!-- 模糊匹配结果 -->
+                                            <div v-for="fuzzy in fuzzyMatches" :key="fuzzy.searchTerm" class="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+                                                <p class="text-yellow-800 font-semibold mb-2">
+                                                    🔍 模糊搜索 "{{ fuzzy.searchTerm }}" 找到 {{ fuzzy.matches.length }} 个匹配
+                                                </p>
+                                                <div class="flex flex-wrap gap-2">
+                                                    <span
+                                                        v-for="match in fuzzy.matches"
+                                                        :key="match"
+                                                        class="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-sm cursor-pointer hover:bg-yellow-500 hover:text-white transition-colors"
+                                                        @click="selectFuzzyMatch(match)"
+                                                    >
+                                                        {{ match }}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                            
+                                            <!-- 区间查询结果 -->
+                                            <div v-for="range in rangeResults" :key="range.label" class="border border-gray-200 rounded-lg overflow-hidden">
+                                                <div class="bg-green-50 p-4 border-b border-green-200 flex justify-between items-center">
+                                                    <span class="text-green-800 font-semibold">{{ range.label }}</span>
+                                                    <span class="px-2 py-1 bg-green-500 text-white rounded-full text-xs font-semibold">
+                                                        匹配 {{ range.matches.length }} 个产品
+                                                    </span>
+                                                </div>
+                                                
+                                                <div v-if="range.matches.length > 0" class="p-4">
+                                                    <h4 class="text-sm font-semibold text-gray-600 mb-3">
+                                                        📋 匹配产品编号 ({{ range.matches.length }} 个)
+                                                    </h4>
+                                                    <div class="flex flex-wrap gap-2 mb-4">
+                                                        <span
+                                                            v-for="product in range.matches"
+                                                            :key="product.code"
+                                                            class="px-3 py-1 bg-gray-100 rounded-full text-sm cursor-pointer hover:bg-green-500 hover:text-white transition-colors"
+                                                            @click="selectCode(product.code)"
+                                                        >
+                                                            {{ product.code }}
+                                                        </span>
+                                                    </div>
+                                                    
+                                                    <!-- 产品卡片 -->
+                                                    <div class="space-y-4">
+                                                        <div 
+                                                            v-for="product in range.matches" 
+                                                            :key="product.code"
+                                                            class="product-card bg-white border border-gray-200 rounded-lg overflow-hidden"
+                                                        >
+                                                            <div class="bg-gray-50 p-4 border-b border-gray-200 flex justify-between items-center">
+                                                                <span class="text-lg font-bold text-green-700">📦 {{ product.code }}</span>
+                                                                <span class="px-2 py-1 bg-green-500 text-white rounded-full text-xs font-semibold">
+                                                                    📊 区间匹配
+                                                                </span>
+                                                            </div>
+                                                            
+                                                            <div class="p-4">
+                                                                <div class="grid grid-cols-2 gap-4 mb-4">
+                                                                    <div>
+                                                                        <label class="text-xs text-gray-500">💰 码价 (Y)</label>
+                                                                        <div class="font-bold">{{ product.price }}</div>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label class="text-xs text-gray-500">💰 米价 (M)</label>
+                                                                        <div class="font-bold">{{ product.priceAlt }}</div>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label class="text-xs text-gray-500">📏 门幅</label>
+                                                                        <div class="font-semibold">{{ product.width }}</div>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label class="text-xs text-gray-500">⚖️ 克重</label>
+                                                                        <div class="font-semibold">{{ product.weight }}</div>
+                                                                    </div>
+                                                                    <div class="col-span-2">
+                                                                        <label class="text-xs text-gray-500">🧵 成分</label>
+                                                                        <div class="font-semibold">{{ product.composition }}</div>
+                                                                    </div>
+                                                                </div>
+                                                                
+                                                                <div v-if="product.notes && product.notes !== '-'" class="bg-red-50 border border-red-200 rounded p-3 mb-4">
+                                                                    <div class="font-bold text-red-700 mb-1">⚠️ 备注</div>
+                                                                    <div class="text-red-600">{{ product.notes }}</div>
+                                                                </div>
+                                                                
+                                                                <div class="bg-gray-50 rounded p-3 flex items-center justify-between">
+                                                                    <div class="flex items-center space-x-3">
+                                                                        <span class="text-sm text-gray-600">🏭 供应商</span>
+                                                                        <span class="font-semibold">{{ product.supplier && product.supplier !== '-' ? product.supplier : '暂无信息' }}</span>
+                                                                    </div>
+                                                                    
+                                                                    <button 
+                                                                        v-if="product.image"
+                                                                        class="px-3 py-1 bg-green-500 text-white rounded text-sm font-semibold hover:bg-green-600 transition-colors"
+                                                                        @click="showImage(product.image, product.code)"
+                                                                    >
+                                                                        查看底卡
+                                                                    </button>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                
+                                                <div v-else class="p-8 text-center">
+                                                    <div class="text-4xl text-gray-300 mb-2">🔍</div>
+                                                    <div class="text-gray-500">暂无匹配产品</div>
+                                                    <div class="text-sm text-gray-400">该区间内没有找到产品</div>
+                                                </div>
+                                            </div>
+                                            
+                                            <!-- 精确匹配结果 -->
+                                            <div class="space-y-4">
+                                                <div 
+                                                    v-for="result in searchResults" 
+                                                    :key="result.code"
+                                                    class="product-card bg-white border border-gray-200 rounded-lg overflow-hidden"
+                                                >
+                                                    <div v-if="result.found">
+                                                        <div class="bg-gray-50 p-4 border-b border-gray-200 flex justify-between items-center">
+                                                            <span class="text-lg font-bold text-green-700">📦 {{ result.code }}</span>
+                                                            <span 
+                                                                :class="{'bg-green-500': result.matchType === 'exact', 'bg-blue-500': result.matchType === 'fuzzy'}"
+                                                                class="px-2 py-1 text-white rounded-full text-xs font-semibold"
+                                                            >
+                                                                {{ result.matchType === 'exact' ? '✓ 精确匹配' : '🎯 模糊匹配' }}
+                                                            </span>
+                                                        </div>
+                                                        
+                                                        <div class="p-4">
+                                                            <div class="grid grid-cols-2 gap-4 mb-4">
+                                                                <div>
+                                                                    <label class="text-xs text-gray-500">💰 码价 (Y)</label>
+                                                                    <div class="font-bold">{{ result.price }}</div>
+                                                                </div>
+                                                                <div>
+                                                                    <label class="text-xs text-gray-500">💰 米价 (M)</label>
+                                                                    <div class="font-bold">{{ result.priceAlt }}</div>
+                                                                </div>
+                                                                <div>
+                                                                    <label class="text-xs text-gray-500">📏 门幅</label>
+                                                                    <div class="font-semibold">{{ result.width }}</div>
+                                                                </div>
+                                                                <div>
+                                                                    <label class="text-xs text-gray-500">⚖️ 克重</label>
+                                                                    <div class="font-semibold">{{ result.weight }}</div>
+                                                                </div>
+                                                                <div class="col-span-2">
+                                                                    <label class="text-xs text-gray-500">🧵 成分</label>
+                                                                    <div class="font-semibold">{{ result.composition }}</div>
+                                                                </div>
+                                                            </div>
+                                                            
+                                                            <div v-if="result.notes && result.notes !== '-'" class="bg-red-50 border border-red-200 rounded p-3 mb-4">
+                                                                <div class="font-bold text-red-700 mb-1">⚠️ 备注</div>
+                                                                <div class="text-red-600">{{ result.notes }}</div>
+                                                            </div>
+                                                            
+                                                            <div class="bg-gray-50 rounded p-3 flex items-center justify-between">
+                                                                <div class="flex items-center space-x-3">
+                                                                    <span class="text-sm text-gray-600">🏭 供应商</span>
+                                                                    <span class="font-semibold">{{ result.supplier && result.supplier !== '-' ? result.supplier : '暂无信息' }}</span>
+                                                                </div>
+                                                                
+                                                                <button 
+                                                                    v-if="result.image"
+                                                                    class="px-3 py-1 bg-green-500 text-white rounded text-sm font-semibold hover:bg-green-600 transition-colors"
+                                                                    @click="showImage(result.image, result.code)"
+                                                                >
+                                                                    查看底卡
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                    
+                                                    <div v-else class="p-8 text-center">
+                                                        <div class="text-4xl text-red-300 mb-2">❌</div>
+                                                        <div class="text-lg font-bold text-red-500">{{ result.code }}</div>
+                                                        <div class="text-red-400">{{ result.error }}</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <!-- 产品管理 -->
+                                    <div v-if="activeTab === 'manage'" class="space-y-6">
+                                        <h2 class="text-xl font-bold text-gray-800 border-b pb-2">产品数据维护</h2>
+                                        
+                                        <!-- 存储状态警告 -->
+                                        <div v-if="storageStatus" :class="{'bg-red-50 border-red-200 text-red-700': storageStatus.type === 'error', 'bg-yellow-50 border-yellow-200 text-yellow-700': storageStatus.type === 'warning'}" class="border rounded-lg p-4">
+                                            <div class="flex items-center">
+                                                <span class="mr-2">{{ storageStatus.type === 'error' ? '⚠️' : '💾' }}</span>
+                                                <span>{{ storageStatus.message }}</span>
+                                            </div>
+                                        </div>
+                                        
+                                        <!-- 添加/编辑产品表单 -->
+                                        <div class="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+                                            <div class="bg-gray-50 p-4 border-b border-gray-200">
+                                                <h3 class="text-lg font-bold text-green-700">➕ 添加/编辑产品</h3>
+                                            </div>
+                                            
+                                            <div class="p-4">
+                                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                    <div>
+                                                        <label class="block text-sm font-medium text-gray-700 mb-1">产品代码 <span class="text-red-500">*</span></label>
+                                                        <input 
+                                                            v-model="productForm.code" 
+                                                            type="text" 
+                                                            class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                            placeholder="例如：C6001, YC2001"
+                                                        >
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-sm font-medium text-gray-700 mb-1">码价</label>
+                                                        <input 
+                                                            v-model="productForm.price" 
+                                                            type="text" 
+                                                            class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                            placeholder="例如：12.5元/码"
+                                                        >
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-sm font-medium text-gray-700 mb-1">米价</label>
+                                                        <input 
+                                                            v-model="productForm.priceAlt" 
+                                                            type="text" 
+                                                            class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                            placeholder="例如：12.5元/米-足米"
+                                                        >
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-sm font-medium text-gray-700 mb-1">门幅</label>
+                                                        <input 
+                                                            v-model="productForm.width" 
+                                                            type="text" 
+                                                            class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                            placeholder="例如：150cm"
+                                                        >
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-sm font-medium text-gray-700 mb-1">成分</label>
+                                                        <input 
+                                                            v-model="productForm.composition" 
+                                                            type="text" 
+                                                            class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                            placeholder="例如：100锦纶"
+                                                        >
+                                                    </div>
+                                                    <div>
+                                                        <label class="block text-sm font-medium text-gray-700 mb-1">克重</label>
+                                                        <input 
+                                                            v-model="productForm.weight" 
+                                                            type="text" 
+                                                            class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                            placeholder="例如：90克/平方（gsm）"
+                                                        >
+                                                    </div>
+                                                    <div class="md:col-span-2">
+                                                        <label class="block text-sm font-medium text-gray-700 mb-1">备注</label>
+                                                        <input 
+                                                            v-model="productForm.notes" 
+                                                            type="text" 
+                                                            class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                            placeholder="例如：颜色价格说明等"
+                                                        >
+                                                    </div>
+                                                    <div class="md:col-span-2">
+                                                        <label class="block text-sm font-medium text-gray-700 mb-1">供应商</label>
+                                                        <input 
+                                                            v-model="productForm.supplier" 
+                                                            type="text" 
+                                                            class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                            placeholder="例如：凯泓K5【KH86】"
+                                                        >
+                                                    </div>
+                                                    
+                                                    <!-- 图片上传 -->
+                                                    <div class="md:col-span-2">
+                                                        <label class="block text-sm font-medium text-gray-700 mb-1">底卡图片</label>
+                                                        <input 
+                                                            type="file" 
+                                                            @change="handleImageUpload"
+                                                            class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                            accept="image/*"
+                                                        >
+                                                        <p class="text-xs text-gray-500 mt-1">支持 JPG/PNG 格式，大小不超过 5MB</p>
+                                                        <div v-if="productForm.imageFile" class="mt-2 text-sm text-green-600">
+                                                            已选择: {{ productForm.imageFile.name }}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                
+                                                <div class="flex flex-wrap gap-3 mt-6">
+                                                    <button 
+                                                        v-if="!editingProduct" 
+                                                        class="px-4 py-2 bg-green-500 text-white rounded-lg font-semibold hover:bg-green-600 transition-colors"
+                                                        @click="addOrUpdateProduct"
+                                                    >
+                                                        添加产品
+                                                    </button>
+                                                    <button 
+                                                        v-if="editingProduct" 
+                                                        class="px-4 py-2 bg-blue-500 text-white rounded-lg font-semibold hover:bg-blue-600 transition-colors"
+                                                        @click="addOrUpdateProduct"
+                                                    >
+                                                        更新产品
+                                                    </button>
+                                                    <button 
+                                                        v-if="editingProduct" 
+                                                        class="px-4 py-2 bg-red-500 text-white rounded-lg font-semibold hover:bg-red-600 transition-colors"
+                                                        @click="deleteProduct"
+                                                    >
+                                                        删除产品
+                                                    </button>
+                                                    <button 
+                                                        class="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg font-semibold hover:bg-gray-300 transition-colors"
+                                                        @click="clearProductForm"
+                                                    >
+                                                        清空表单
+                                                    </button>
+                                                </div>
+                                                
+                                                <!-- 操作反馈 -->
+                                                <div v-if="operationMessage.text" :class="{'bg-green-50 text-green-700': operationMessage.type === 'success', 'bg-red-50 text-red-700': operationMessage.type === 'error', 'bg-blue-50 text-blue-700': operationMessage.type === 'loading'}" class="mt-4 p-3 rounded">
+                                                    {{ operationMessage.text }}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <!-- 产品列表 -->
+                                        <div class="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+                                            <div class="bg-gray-50 p-4 border-b border-gray-200">
+                                                <h3 class="text-lg font-bold text-green-700">🔍 产品列表与搜索</h3>
+                                            </div>
+                                            
+                                            <div class="p-4">
+                                                <div class="mb-4">
+                                                    <input
+                                                        v-model="manageSearchTerm"
+                                                        type="text"
+                                                        class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                        placeholder="搜索产品代码或供应商..."
+                                                    >
+                                                </div>
+                                                
+                                                <div class="space-y-4">
+                                                    <div 
+                                                        v-for="code in renderManageProducts()" 
+                                                        :key="code"
+                                                        class="product-card bg-white border border-gray-200 rounded-lg overflow-hidden"
+                                                    >
+                                                        <div class="p-4 border-b border-gray-200">
+                                                            <div class="flex justify-between items-center">
+                                                                <span class="text-lg font-bold text-green-700">📦 {{ code }}</span>
+                                                                <div class="flex space-x-2">
+                                                                    <button 
+                                                                        class="px-3 py-1 bg-blue-500 text-white rounded text-sm font-semibold hover:bg-blue-600 transition-colors"
+                                                                        @click="editProduct(code)"
+                                                                    >
+                                                                        编辑
+                                                                    </button>
+                                                                    <button 
+                                                                        class="px-3 py-1 bg-red-500 text-white rounded text-sm font-semibold hover:bg-red-600 transition-colors"
+                                                                        @click="deleteProductFromList(code)"
+                                                                    >
+                                                                        删除
+                                                                    </button>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                        
+                                                        <div class="p-4">
+                                                            <div class="grid grid-cols-2 gap-4 mb-4">
+                                                                <div class="text-center">
+                                                                    <label class="text-xs text-gray-500">💰 码价</label>
+                                                                    <div class="font-bold">{{ catalogData[code].price }}</div>
+                                                                </div>
+                                                                <div class="text-center">
+                                                                    <label class="text-xs text-gray-500">💰 米价</label>
+                                                                    <div class="font-bold">{{ catalogData[code].priceAlt }}</div>
+                                                                </div>
+                                                                <div class="text-center">
+                                                                    <label class="text-xs text-gray-500">📏 门幅</label>
+                                                                    <div class="font-semibold">{{ catalogData[code].width }}</div>
+                                                                </div>
+                                                                <div class="text-center">
+                                                                    <label class="text-xs text-gray-500">⚖️ 克重</label>
+                                                                    <div class="font-semibold">{{ catalogData[code].weight }}</div>
+                                                                </div>
+                                                                <div class="col-span-2 text-center">
+                                                                    <label class="text-xs text-gray-500">🧵 成分</label>
+                                                                    <div class="font-semibold">{{ catalogData[code].composition }}</div>
+                                                                </div>
+                                                                <div class="col-span-2 text-center">
+                                                                    <label class="text-xs text-gray-500">🏭 供应商</label>
+                                                                    <div class="font-semibold">{{ catalogData[code].supplier }}</div>
+                                                                </div>
+                                                            </div>
+                                                            
+                                                            <div v-if="catalogData[code].notes && catalogData[code].notes !== '-'" class="bg-red-50 border border-red-200 rounded p-3 mb-4">
+                                                                <div class="text-red-700">{{ catalogData[code].notes }}</div>
+                                                            </div>
+                                                            
+                                                            <div class="flex justify-center">
+                                                                <div 
+                                                                    v-if="catalogData[code].image"
+                                                                    class="cursor-pointer"
+                                                                    @click="showImage(catalogData[code].image, code)"
+                                                                >
+                                                                    <img 
+                                                                        :src="catalogData[code].image" 
+                                                                        :alt="'产品 ' + code + ' 底卡图片'"
+                                                                        class="w-20 h-20 object-cover rounded border border-gray-200 image-preview"
+                                                                        @error="e => e.target.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEwMCUiIGhlaWdodD0iMTAwJSIgZmlsbD0iI2YwZjBmMCIvPjx0ZXh0IHg9IjUwJSIgeT0iNTAlIiBmb250LWZhbWlseT0iQXJpYWwsIHNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTIiIGZpbGw9IiM5OTkiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGR5PSIuM2VtIj7lm77niYc8L3RleHQ+PC9zdmc+'"
+                                                                    />
+                                                                </div>
+                                                                <div v-else class="w-20 h-20 bg-gray-100 rounded border border-gray-200 flex items-center justify-center text-gray-400 text-xs text-center">
+                                                                    无图片
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                    
+                                                    <div v-if="renderManageProducts().length === 0" class="text-center p-8 bg-white rounded-lg border border-gray-200">
+                                                        <div class="text-4xl text-gray-300 mb-2">📦</div>
+                                                        <div class="text-gray-500">暂无产品</div>
+                                                        <div class="text-sm text-gray-400">通过上方表单添加或上传文件导入</div>
+                                                    </div>
+                                                    
+                                                    <div v-if="hasMoreProducts" class="text-center mt-4">
+                                                        <button 
+                                                            class="px-4 py-2 bg-green-500 text-white rounded-lg font-semibold hover:bg-green-600 transition-colors"
+                                                            @click="loadMoreProducts"
+                                                        >
+                                                            加载更多
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <!-- 数据备份 -->
+                                    <div v-if="activeTab === 'data'" class="space-y-6">
+                                        <h2 class="text-xl font-bold text-gray-800 border-b pb-2">数据备份</h2>
+                                        
+                                        <!-- Cloudflare R2配置 -->
+                                        <div class="bg-green-50 border border-green-200 rounded-lg p-4">
+                                            <h3 class="text-lg font-bold text-green-700 mb-4">☁️ Cloudflare R2 + 自定义域名配置</h3>
+                                            
+                                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                                                <div>
+                                                    <label class="block text-sm font-medium text-gray-700 mb-1">Account ID</label>
+                                                    <input 
+                                                        v-model="r2Config.accountId" 
+                                                        type="text" 
+                                                        class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                        placeholder="请输入Cloudflare Account ID"
+                                                    >
+                                                </div>
+                                                <div>
+                                                    <label class="block text-sm font-medium text-gray-700 mb-1">Access Key ID</label>
+                                                    <input 
+                                                        v-model="r2Config.accessKey" 
+                                                        type="text" 
+                                                        class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                        placeholder="请输入R2 Access Key ID"
+                                                    >
+                                                </div>
+                                                <div>
+                                                    <label class="block text-sm font-medium text-gray-700 mb-1">Secret Access Key</label>
+                                                    <input 
+                                                        v-model="r2Config.secretKey" 
+                                                        type="password" 
+                                                        class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                        placeholder="请输入R2 Secret Access Key"
+                                                    >
+                                                </div>
+                                                <div>
+                                                    <label class="block text-sm font-medium text-gray-700 mb-1">Bucket 名称</label>
+                                                    <input 
+                                                        v-model="r2Config.bucket" 
+                                                        type="text" 
+                                                        class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                        placeholder="请输入存储桶名称"
+                                                    >
+                                                </div>
+                                                <div class="md:col-span-2">
+                                                    <label class="block text-sm font-medium text-gray-700 mb-1">自定义域名</label>
+                                                    <input 
+                                                        v-model="r2Config.customDomain" 
+                                                        type="text" 
+                                                        class="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                                        placeholder="https://img.yudong-textile.top"
+                                                    >
+                                                </div>
+                                            </div>
+                                            
+                                            <div class="button-group">
+                                                <button 
+                                                    class="px-4 py-2 bg-green-500 text-white rounded-lg font-semibold hover:bg-green-600 transition-colors"
+                                                    @click="saveR2Config"
+                                                >
+                                                    保存配置
+                                                </button>
+                                                <button 
+                                                    class="px-4 py-2 bg-blue-500 text-white rounded-lg font-semibold hover:bg-blue-600 transition-colors"
+                                                    @click="testR2Connection"
+                                                >
+                                                    测试连接
+                                                </button>
+                                            </div>
+                                            
+                                            <div class="bg-blue-50 border border-blue-200 rounded p-3 mt-4">
+                                                <p class="text-blue-800">
+                                                    💡 配置说明：在Cloudflare控制台创建R2存储桶，将您的域名 img.yudong-textile.top 通过CNAME记录指向R2存储桶。
+                                                </p>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="data-backup-grid">
+                                            <!-- 数据上传与导入 -->
+                                            <div class="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+                                                <div class="bg-gray-50 p-4 border-b border-gray-200">
+                                                    <h3 class="text-lg font-bold text-green-700">📤 数据上传与导入</h3>
+                                                </div>
+                                                
+                                                <div class="p-4 space-y-4">
+                                                    <div class="button-group">
+                                                        <div>
+                                                            <input 
+                                                                type="file" 
+                                                                id="localDbInput"
+                                                                @change="importDatabase"
+                                                                accept=".json,.zip"
+                                                                class="hidden"
+                                                            >
+                                                            <label 
+                                                                for="localDbInput"
+                                                                class="px-4 py-2 bg-green-500 text-white rounded-lg font-semibold hover:bg-green-600 transition-colors cursor-pointer inline-block w-full text-center"
+                                                            >
+                                                                📂 本地DB导入
+                                                            </label>
+                                                        </div>
+                                                        
+                                                        <button 
+                                                            class="px-4 py-2 bg-blue-500 text-white rounded-lg font-semibold hover:bg-blue-600 transition-colors"
+                                                            @click="loadR2BackupFiles"
+                                                        >
+                                                            ☁️ Cloudflare R2导入
+                                                        </button>
+                                                    </div>
+                                                    
+                                                    <!-- R2备份文件列表 -->
+                                                    <div v-if="backupFiles.length > 0" class="border border-gray-200 rounded-lg max-h-60 overflow-y-auto">
+                                                        <div 
+                                                            v-for="file in backupFiles" 
+                                                            :key="file.Key"
+                                                            class="p-3 border-b border-gray-200 last:border-b-0 hover:bg-gray-50 cursor-pointer flex justify-between items-center"
+                                                            @click="importFromR2Backup(file.Key)"
+                                                        >
+                                                            <div>
+                                                                <div class="font-semibold text-sm">{{ file.Key.replace('yudong-cloud/', '') }}</div>
+                                                                <div class="text-xs text-gray-500">
+                                                                    {{ formatBytes(file.Size) }} · {{ new Date(file.LastModified).toLocaleString('zh-CN') }}
+                                                                </div>
+                                                            </div>
+                                                            <span>⬇️</span>
+                                                        </div>
+                                                    </div>
+                                                    
+                                                    <div class="bg-yellow-50 border border-yellow-200 rounded p-3">
+                                                        <p class="text-yellow-800">
+                                                            导入数据库将覆盖当前所有产品数据，请谨慎操作。
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            
+                                            <!-- 备份与清空 -->
+                                            <div class="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+                                                <div class="bg-gray-50 p-4 border-b border-gray-200">
+                                                    <h3 class="text-lg font-bold text-green-700">📥 数据备份与清空</h3>
+                                                </div>
+                                                
+                                                <div class="p-4 space-y-4">
+                                                    <div class="button-group">
+                                                        <button 
+                                                            class="px-4 py-2 bg-yellow-500 text-white rounded-lg font-semibold hover:bg-yellow-600 transition-colors"
+                                                            @click="exportAndUploadBackup"
+                                                        >
+                                                            ZIP 导出完整备份
+                                                        </button>
+                                                        <button 
+                                                            class="px-4 py-2 bg-red-500 text-white rounded-lg font-semibold hover:bg-red-600 transition-colors"
+                                                            @click="clearData"
+                                                        >
+                                                            ⚠️ 清空所有数据
+                                                        </button>
+                                                    </div>
+                                                    
+                                                    <div class="bg-red-50 border border-red-200 rounded p-3">
+                                                        <p class="text-red-700">
+                                                            完整备份包含数据表和所有图片，建议定期导出。
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 图片模态框 -->
+                    <div v-if="imageModalVisible" class="fixed inset-0 bg-black bg-opacity-80 flex items-center justify-center z-50 p-4">
+                        <div class="bg-white rounded-lg max-w-4xl max-h-full overflow-auto relative">
+                            <button 
+                                class="absolute top-4 right-4 w-8 h-8 bg-red-500 text-white rounded-full flex items-center justify-center hover:bg-red-600 transition-colors"
+                                @click="closeImageModal"
+                            >
+                                ✕
+                            </button>
+                            <img :src="currentImage" alt="产品底卡" class="max-w-full h-auto">
+                        </div>
+                    </div>
+                </div>
+                `
+            });
+            
+            // 挂载应用
+            app.use(ElementPlus);
+            app.mount('#app');
+        });
+    </script>
+</body>
+</html>
